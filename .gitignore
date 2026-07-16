@@ -1,0 +1,5 @@
+# Matches any .pyc file anywhere in the project
+*.pyc
+
+# Matches the entire Python cache folders wherever they appear
+__pycache__/
