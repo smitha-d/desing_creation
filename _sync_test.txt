@@ -1,0 +1,1 @@
+bash-side-write-test-content-12345

@@ -1,0 +1,6 @@
+langgraph>=0.2.0
+shapely>=2.0
+networkx>=3.0
+pyproj>=3.5
+requests>=2.31
+psycopg2-binary>=2.9
