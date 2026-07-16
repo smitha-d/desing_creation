@@ -52,7 +52,6 @@ def make_nodes(client: IQGeoClient, address_client=None):
         # under the hood -- open your browser's Network tab while that grid
         # loads to confirm the real endpoint/params for iqgeo_client.py.
         addresses = address_source.get_features_in_polygon("address", polygon_wkt)
-        print('===============================addresses', addresses)
         demand_points = []
         for a in addresses:
             lon, lat = geometry.parse_point(a["location"])
@@ -92,18 +91,18 @@ def make_nodes(client: IQGeoClient, address_client=None):
             s["id"]: geometry.parse_point(s["location"])
             for s in (*manholes, *poles, *cabinets, *buildings)
         }
-        route_graph = geometry.build_route_graph(oh_routes, ug_routes, points)
-
         olt_candidates = [o for o in olts_raw if _has_available_port(o)]
 
         return {
             "demand_points": demand_points,
             "candidate_tie_ins": candidate_tie_ins,
             "olt_candidates": olt_candidates,
-            # stashed on state for the route planner; not part of the
-            # persisted schema documented in state.py, but LangGraph
-            # TypedDicts tolerate extra keys fine.
-            "_route_graph": route_graph,
+            # stashed on state for the route planner, which rebuilds the
+            # routing graph from these; not part of the persisted design
+            # schema, but declared in state.py so StateGraph actually
+            # creates a channel for them.
+            "_oh_routes": oh_routes,
+            "_ug_routes": ug_routes,
             "_points": points,
         }
 
@@ -114,7 +113,9 @@ def make_nodes(client: IQGeoClient, address_client=None):
         if not demand_points:
             return {"violations": ["no demand points (addresses) found inside the design polygon"]}
 
-        route_graph: geometry.RouteGraph = state["_route_graph"]
+        route_graph = geometry.build_route_graph(
+            state["_oh_routes"], state["_ug_routes"], state["_points"]
+        )
         points = state["_points"]
 
         centroid = geometry.centroid([(d["lon"], d["lat"]) for d in demand_points])
@@ -163,6 +164,13 @@ def make_nodes(client: IQGeoClient, address_client=None):
 
     def route_or_write(state: FTTHDesignState) -> str:
         """Conditional edge used by graph.py."""
+        if state.get("feeder_path") is None:
+            # route_planner_node couldn't find any OLT<->tie-in path at all --
+            # there's nothing for feature_writer_node to build (no
+            # tie_in_structure/olt/feeder_path on state), and retrying won't
+            # change that since the routing graph/candidates haven't changed.
+            # Skip straight to human review with the violations.
+            return "no_route"
         if state["violations"] and state.get("retry_count", 0) < RULES.max_retries:
             return "retry"
         return "proceed"  # either compliant, or out of retries -- either way,

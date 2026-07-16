@@ -3,13 +3,16 @@ Builds the LangGraph state machine described in the phased PoC plan:
 
     ingest -> route_planner -> compliance_audit --(fail, retries left)--> route_planner
                                             |
-                                       (pass, or retries exhausted)
-                                            v
-                                     feature_writer -> bom -> human_review -> END
+                             (pass, or retries exhausted) --> feature_writer -> bom -+
+                                            |                                        |
+                                    (no route found at all) ------------------------>+--> human_review -> END
 
 The retry edge is bounded by RULES.max_retries (see rules.route_or_write /
 config.py) so a design that can't be made compliant surfaces to the human
-reviewer with its violations listed, instead of looping forever.
+reviewer with its violations listed, instead of looping forever. A design
+with no viable OLT<->tie-in path at all skips feature_writer/bom entirely
+(there's nothing to build) and goes straight to human_review with its
+violations.
 
 Requires: langgraph>=0.2 (for `interrupt`/`Command`-based human-in-the-loop).
 Confirm against your installed version -- the interrupt API has moved
@@ -43,7 +46,11 @@ def build_graph(client: IQGeoClient, address_client=None, checkpointer=None):
     workflow.add_conditional_edges(
         "compliance_audit",
         nodes["route_or_write"],
-        {"retry": "route_planner", "proceed": "feature_writer"},
+        {
+            "retry": "route_planner",
+            "proceed": "feature_writer",
+            "no_route": "human_review",
+        },
     )
     workflow.add_edge("feature_writer", "bom")
     workflow.add_edge("bom", "human_review")

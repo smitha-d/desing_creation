@@ -32,6 +32,22 @@ class FTTHDesignState(TypedDict, total=False):
     candidate_tie_ins: list[str]          # structure ids (manhole/pole/cabinet)
     olt_candidates: list[dict]            # fiber_olt rows with available ports
 
+    # -- ingest_node internals, consumed by route_planner_node --
+    # Must be declared here even though they're not part of the persisted
+    # design schema: StateGraph(FTTHDesignState) only creates a channel for
+    # keys present in this TypedDict's annotations, so any key a node
+    # returns that isn't declared here is silently dropped instead of
+    # merged into state.
+    #
+    # Kept as plain feature dicts / tuples rather than a built
+    # geometry.RouteGraph -- the checkpointer msgpack-serializes state on
+    # every step, and RouteGraph wraps an nx.Graph, which isn't
+    # serializable. route_planner_node rebuilds the graph from these (cheap)
+    # each time it runs instead.
+    _oh_routes: list[dict]
+    _ug_routes: list[dict]
+    _points: dict          # structure id -> (lon, lat)
+
     # -- route_planner_node output --
     olt: dict | None
     tie_in_structure: str | None
