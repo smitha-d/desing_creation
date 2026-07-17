@@ -73,10 +73,11 @@ class IQGeoClient:
         # the standard login form, or a token issued by an auth endpoint.
         # Confirm the real login route/flow for your deployment.
         resp = self.session.post(
-            f"{self.base_url}/auth/login",
+            f"{self.base_url}/auth",
             data={"user": username, "pass": password},
             timeout=15,
         )
+        print('authentication response:', resp.status_code, resp.text)
         if resp.status_code >= 400:
             log.warning(
                 "Login endpoint returned %s -- confirm the auth route for "
