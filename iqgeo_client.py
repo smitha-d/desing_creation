@@ -73,7 +73,7 @@ class IQGeoClient:
         # the standard login form, or a token issued by an auth endpoint.
         # Confirm the real login route/flow for your deployment.
         resp = self.session.post(
-            f"{self.base_url}/auth",
+            f"{self.base_url}/auth/login",
             data={"user": username, "pass": password},
             timeout=15,
         )
@@ -128,24 +128,98 @@ class IQGeoClient:
         return resp.json()
 
     # -- feature CRUD -----------------------------------------------------
+    #
+    # Confirmed (captured from NMT's own "Add Object" panel via the browser
+    # Network tab, placing a manhole into a design):
+    #
+    #   POST /modules/comms/feature?delta=design%2FTestDesign1&application=mywcom&lang=en-US
+    #   body: [["insert", "manhole", {
+    #       "type": "Feature",
+    #       "geometry": {"type": "Point", "coordinates": [lon, lat], "world_name": "geo"},
+    #       "properties": {"name": null, ..., "design_id": null, "create_user": "admin"},
+    #       "secondary_geometries": {},
+    #   }]]
+    #
+    # Two things this confirms that the old placeholder got wrong:
+    #   1. There's one shared endpoint for every feature type (the type name
+    #      goes inside the operation tuple, not the URL path).
+    #   2. The design is selected via the `delta` query param
+    #      ("design/<Name>") -- NOT by setting a design_id field on the
+    #      feature itself (the captured manhole's properties literally have
+    #      "design_id": null even though it landed inside the design).
+    #
+    # What's still unconfirmed: the response body shape for a write (only a
+    # read, /select_within, has been checked against a real response so
+    # far). _parse_feature_write_response() below is a best-effort guess --
+    # run this once, share the actual response, and I'll pin it down exactly
+    # the way we did for reads.
 
-    def create_feature(self, feature_type: str, fields: dict[str, Any]) -> str:
+    def create_feature(self, feature_type: str, fields: dict[str, Any], design_id: str) -> str:
         """
-        Create a feature and return the server-assigned id (e.g.
-        'fiber_splitter/41'). design_id should already be set on `fields`
-        by the caller so the object lands inside the right design/job.
+        Create a feature inside `design_id` (e.g. "design/TestDesign1") and
+        return the server-assigned id.
+
+        `fields` must contain either a "location" ([lon, lat] -- for point
+        features like structures/equipment) or a "path" ([[lon,lat], ...]
+        -- for line features like cables/circuits); it's popped out and
+        turned into the `geometry` block, the rest of `fields` becomes
+        `properties` as-is. Do NOT put design_id in `fields` -- it goes in
+        the `delta` param instead (see module note above).
         """
-        url = f"{self.base_url}/{self.app}/rest/{feature_type}"
-        resp = self.session.post(url, json=fields, timeout=30)
+        fields = dict(fields)
+        location = fields.pop("location", None)
+        path = fields.pop("path", None)
+
+        if path is not None:
+            geometry_block = {"type": "LineString", "coordinates": [list(p) for p in path], "world_name": "geo"}
+        elif location is not None:
+            geometry_block = {"type": "Point", "coordinates": list(location), "world_name": "geo"}
+        else:
+            raise ValueError(
+                f"{feature_type}: create_feature needs a 'location' or 'path' in fields "
+                f"to build the geometry block -- got neither."
+            )
+
+        feature_payload = {
+            "type": "Feature",
+            "geometry": geometry_block,
+            "properties": fields,
+            "secondary_geometries": {},
+        }
+
+        url = f"{self.base_url}/modules/comms/feature"
+        params = {"delta": design_id, "application": self.app, "lang": "en-US"}
+        resp = self.session.post(url, params=params, json=[["insert", feature_type, feature_payload]], timeout=30)
         resp.raise_for_status()
-        body = resp.json()
-        new_id = body.get("id") or f"{feature_type}/{body.get('id_value')}"
+        new_id = _parse_feature_write_response(resp.json(), feature_type)
         log.info("created %s", new_id)
         return new_id
 
-    def update_feature(self, feature_type: str, feature_id: str, fields: dict[str, Any]) -> None:
-        url = f"{self.base_url}/{self.app}/rest/{feature_type}/{feature_id}"
-        resp = self.session.put(url, json=fields, timeout=30)
+    def update_feature(self, feature_type: str, feature_id: str, fields: dict[str, Any], design_id: str) -> None:
+        """Mirrors create_feature's ["insert", ...] shape as ["update", ...] --
+        NOT yet confirmed against a real captured request; adjust if your
+        instance's update operation looks different."""
+        fields = dict(fields)
+        location = fields.pop("location", None)
+        path = fields.pop("path", None)
+        geometry_block = None
+        if path is not None:
+            geometry_block = {"type": "LineString", "coordinates": [list(p) for p in path], "world_name": "geo"}
+        elif location is not None:
+            geometry_block = {"type": "Point", "coordinates": list(location), "world_name": "geo"}
+
+        feature_payload = {
+            "type": "Feature",
+            "id": feature_id,
+            "properties": fields,
+            "secondary_geometries": {},
+        }
+        if geometry_block is not None:
+            feature_payload["geometry"] = geometry_block
+
+        url = f"{self.base_url}/modules/comms/feature"
+        params = {"delta": design_id, "application": self.app, "lang": "en-US"}
+        resp = self.session.post(url, params=params, json=[["update", feature_type, feature_payload]], timeout=30)
         resp.raise_for_status()
 
     # -- port / capacity info ---------------------------------------------
@@ -240,3 +314,47 @@ def _flatten_geojson_feature(feature: dict, feature_type: str) -> dict:
         flat["path"] = geometry_obj.get("coordinates")
 
     return flat
+
+
+def _parse_feature_write_response(payload, feature_type: str) -> str:
+    """
+    Best-effort parse of a create/update response into the new feature's
+    "type/id" string -- UNCONFIRMED, only the /select_within read response
+    has actually been verified so far. Tries the shapes most likely for an
+    ["insert", type, feature] batch operation; run create_feature() once,
+    share the real response, and this should get replaced with an exact
+    parse instead of guesswork.
+    """
+    def _extract_id(obj):
+        if isinstance(obj, dict):
+            if "id" in obj:
+                return obj["id"]
+            if "properties" in obj and isinstance(obj["properties"], dict) and "id" in obj["properties"]:
+                return obj["properties"]["id"]
+        return None
+
+    candidate = None
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        # mirror the request shape: ["insert", type, feature] -> feature is index 2
+        if isinstance(first, list) and len(first) >= 3:
+            candidate = _extract_id(first[2])
+        else:
+            candidate = _extract_id(first)
+    elif isinstance(payload, dict):
+        candidate = _extract_id(payload)
+        if candidate is None and "features" in payload and payload["features"]:
+            candidate = _extract_id(payload["features"][0])
+
+    if candidate is None:
+        log.warning(
+            "unrecognised create/update response shape for %s -- got %r. "
+            "Falling back to a random-looking placeholder id; update "
+            "_parse_feature_write_response() in iqgeo_client.py once "
+            "you've inspected a real response.",
+            feature_type, payload,
+        )
+        import uuid
+        candidate = f"UNCONFIRMED-{uuid.uuid4().hex[:8]}"
+
+    return f"{feature_type}/{candidate}"

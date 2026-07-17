@@ -2,4 +2,4 @@
 *.pyc
 
 # Matches the entire Python cache folders wherever they appear
-__pycache__/
+__pycache__/*.*

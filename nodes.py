@@ -91,18 +91,18 @@ def make_nodes(client: IQGeoClient, address_client=None):
             s["id"]: geometry.parse_point(s["location"])
             for s in (*manholes, *poles, *cabinets, *buildings)
         }
+        route_graph = geometry.build_route_graph(oh_routes, ug_routes, points)
+
         olt_candidates = [o for o in olts_raw if _has_available_port(o)]
 
         return {
             "demand_points": demand_points,
             "candidate_tie_ins": candidate_tie_ins,
             "olt_candidates": olt_candidates,
-            # stashed on state for the route planner, which rebuilds the
-            # routing graph from these; not part of the persisted design
-            # schema, but declared in state.py so StateGraph actually
-            # creates a channel for them.
-            "_oh_routes": oh_routes,
-            "_ug_routes": ug_routes,
+            # stashed on state for the route planner; not part of the
+            # persisted schema documented in state.py, but LangGraph
+            # TypedDicts tolerate extra keys fine.
+            "_route_graph": route_graph,
             "_points": points,
         }
 
@@ -113,9 +113,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
         if not demand_points:
             return {"violations": ["no demand points (addresses) found inside the design polygon"]}
 
-        route_graph = geometry.build_route_graph(
-            state["_oh_routes"], state["_ug_routes"], state["_points"]
-        )
+        route_graph: geometry.RouteGraph = state["_route_graph"]
         points = state["_points"]
 
         centroid = geometry.centroid([(d["lon"], d["lat"]) for d in demand_points])
@@ -156,7 +154,23 @@ def make_nodes(client: IQGeoClient, address_client=None):
     # -- Phase 4: compliance audit ------------------------------------------
 
     def compliance_audit_node(state: FTTHDesignState) -> dict:
-        violations = rules.audit(dict(state), RULES)
+        # route_planner_node can fail to produce a plan at all -- no demand
+        # points, no tie-in candidate on the routing graph, no OLT with a
+        # free port graph-connected to the tie-in -- and already returns
+        # its own specific reason in `violations` when that happens.
+        # rules.audit() assumes a full plan exists (feeder_path, splitter_tree,
+        # tie_in_point, ...) and its own feeder_path-is-None check produces
+        # a generic "no route path found" message -- calling it
+        # unconditionally here was silently overwriting route_planner's
+        # actual, more specific reason. Only run the full loss-budget /
+        # drop-length / capacity audit once a plan genuinely exists.
+        if state.get("feeder_path") is None:
+            violations = state.get("violations") or [
+                "route planner did not produce a plan for this polygon "
+                "(no earlier reason recorded -- check ingest_node's fetch results)"
+            ]
+        else:
+            violations = rules.audit(dict(state), RULES)
         return {
             "violations": violations,
             "retry_count": state.get("retry_count", 0) + (1 if violations else 0),
@@ -164,13 +178,6 @@ def make_nodes(client: IQGeoClient, address_client=None):
 
     def route_or_write(state: FTTHDesignState) -> str:
         """Conditional edge used by graph.py."""
-        if state.get("feeder_path") is None:
-            # route_planner_node couldn't find any OLT<->tie-in path at all --
-            # there's nothing for feature_writer_node to build (no
-            # tie_in_structure/olt/feeder_path on state), and retrying won't
-            # change that since the routing graph/candidates haven't changed.
-            # Skip straight to human review with the violations.
-            return "no_route"
         if state["violations"] and state.get("retry_count", 0) < RULES.max_retries:
             return "retry"
         return "proceed"  # either compliant, or out of retries -- either way,
@@ -188,14 +195,18 @@ def make_nodes(client: IQGeoClient, address_client=None):
         records: dict[str, dict[str, dict]] = {}
 
         def make(feature_type: str, fields: dict) -> str:
-            fields = {**fields, "design_id": design_id}
-            new_id = client.create_feature(feature_type, fields)
+            # design_id goes to IQGeoClient.create_feature as the `delta`
+            # param, NOT inside `fields` -- confirmed from a captured
+            # real request: a manually-placed manhole's own properties had
+            # "design_id": null even though it landed inside the design.
+            new_id = client.create_feature(feature_type, fields, design_id)
             created.setdefault(feature_type, []).append(new_id)
-            records.setdefault(feature_type, {})[new_id] = {**fields, "id": new_id}
+            records.setdefault(feature_type, {})[new_id] = {**fields, "id": new_id, "design_id": design_id}
             return new_id
 
         tie_in = state["tie_in_structure"]
         tie_in_point = state["tie_in_point"]
+        points = state["_points"]  # structure_id -> (lon, lat), set by ingest_node
 
         # one new splice closure at the tie-in structure to house the splitter(s)
         closure_id = make("splice_closure", {
@@ -223,17 +234,23 @@ def make_nodes(client: IQGeoClient, address_client=None):
         # housing should really be the specific conduit pulled through each
         # hop; selecting/verifying spare conduit capacity is a TODO left as
         # a stub so this doesn't silently assume capacity that isn't there).
+        path = state["feeder_path"]
+        feeder_coords = [list(points[sid]) for sid in path]
         feeder_cable_id = make("fiber_cable", {
             "name": f"AUTO-FCB-{design_id}",
             "type": "External",
             "fiber_count": max(64, len(state["demand_points"]) * 2),
             "directed": True,
             "loss": RULES.fiber_cable_loss_db_per_km,
+            "path": feeder_coords,
         })
-        path = state["feeder_path"]
         segment_ids = []
         prev_segment = None
         for a, b in zip(path, path[1:]):
+            # straight two-point line per hop -- an approximation, not the
+            # real conduit/route bend geometry (same simplification as the
+            # conduit-capacity TODO above; fine for getting a valid feature
+            # created, not for a construction-accurate drawing).
             seg_id = make("mywcom_fiber_segment", {
                 "cable": feeder_cable_id,
                 "in_structure": a,
@@ -241,6 +258,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
                 "in_segment": prev_segment,
                 "directed": True,
                 "forward": True,
+                "path": [list(points[a]), list(points[b])],
             })
             if prev_segment is not None:
                 make("mywcom_fiber_connection", {
@@ -251,6 +269,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
                     "splice": True,
                     "root_housing": a,
                     "housing": a,
+                    "location": list(points[a]),
                 })
             segment_ids.append(seg_id)
             prev_segment = seg_id
@@ -261,7 +280,14 @@ def make_nodes(client: IQGeoClient, address_client=None):
         # drop against that splitter's remaining port count, which needs
         # the same conduit/port-capacity wiring flagged in the README TODOs.
         last_splitter = splitter_ids[-1]
+        olt_point = tie_in_point
+        try:
+            olt_point = geometry.parse_point(state["olt"]["location"])
+        except (KeyError, ValueError):
+            pass  # fall back to tie_in_point if the OLT dict has no usable location
+
         for dp in state["demand_points"]:
+            dp_point = [dp["lon"], dp["lat"]]
             ont_id = make("fiber_ont", {
                 "name": f"AUTO-ONT-{dp['address_id'].split('/')[-1]}",
                 "n_fiber_in_ports": 4,
@@ -270,7 +296,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
                                     # wall_box/building once that lookup/creation
                                     # step is wired in -- left explicit rather
                                     # than silently wrong.
-                "location": [dp["lon"], dp["lat"]],
+                "location": dp_point,
                 "service_status": "Designing",
             })
 
@@ -284,6 +310,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
                 "fiber_count": 2,
                 "directed": True,
                 "loss": RULES.fiber_cable_loss_db_per_km,
+                "path": [list(tie_in_point), dp_point],
             })
             make("mywcom_fiber_segment", {
                 "cable": drop_cable_id,
@@ -294,6 +321,7 @@ def make_nodes(client: IQGeoClient, address_client=None):
                 "length": dp["drop_length_m"],
                 "directed": True,
                 "forward": True,
+                "path": [list(tie_in_point), dp_point],
             })
 
             make("ftth_circuit", {
@@ -306,6 +334,11 @@ def make_nodes(client: IQGeoClient, address_client=None):
                 "status": "Designing",
                 "address": dp["address_id"],
                 "service_type": "Direct",
+                # rough end-to-end path for the circuit record: OLT ->
+                # feeder route -> tie-in -> drop -> ONT. Same
+                # straight-line-per-hop approximation as the feeder/drop
+                # segments above.
+                "path": [list(olt_point), *feeder_coords, dp_point],
             })
 
         return {"created_features": created, "_records": records}

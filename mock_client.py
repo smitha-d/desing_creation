@@ -53,17 +53,6 @@ class MockIQGeoClient:
             # in_structure/out_structure/length.
             return rows
 
-        if feature_type == "fiber_olt":
-            # OLTs don't carry their own location in this slice either --
-            # they sit inside root_housing (a building/manhole/pole/cabinet),
-            # so filter by that structure's location instead.
-            out = []
-            for r in rows:
-                loc = self._structure_location(r.get("root_housing"))
-                if loc and poly.contains(Point(*loc)):
-                    out.append(r)
-            return out
-
         out = []
         for r in rows:
             loc = r.get("location")
@@ -71,31 +60,24 @@ class MockIQGeoClient:
                 out.append(r)
         return out
 
-    def _structure_location(self, structure_id: str | None) -> tuple[float, float] | None:
-        if not structure_id:
-            return None
-        for feature_type in ("manhole", "pole", "cabinet", "building"):
-            for r in self._data.get(feature_type, []):
-                if r["id"] == structure_id:
-                    loc = r.get("location")
-                    return geometry.parse_point(loc) if loc else None
-        return None
-
     def get_feature(self, feature_type: str, feature_id: str) -> dict:
         for r in self._data.get(feature_type, []):
             if r["id"] == feature_id:
                 return r
         raise KeyError(feature_id)
 
-    def create_feature(self, feature_type: str, fields: dict) -> str:
+    def create_feature(self, feature_type: str, fields: dict, design_id: str) -> str:
+        # signature matches IQGeoClient.create_feature -- design_id is the
+        # `delta` target on the real client, just logged here since the
+        # mock has no actual design/version concept.
         self._next_id.setdefault(feature_type, 0)
         self._next_id[feature_type] += 1
         new_id = f"{feature_type}/AUTO-{self._next_id[feature_type]}"
-        print(f"[mock create] {new_id}  {fields}")
+        print(f"[mock create] {new_id} (design={design_id})  {fields}")
         return new_id
 
-    def update_feature(self, feature_type: str, feature_id: str, fields: dict) -> None:
-        print(f"[mock update] {feature_id}  {fields}")
+    def update_feature(self, feature_type: str, feature_id: str, fields: dict, design_id: str) -> None:
+        print(f"[mock update] {feature_id} (design={design_id})  {fields}")
 
     def get_port_info(self, feature_type: str, feature_id: str, side: str) -> dict:
         f = self.get_feature(feature_type, feature_id)
